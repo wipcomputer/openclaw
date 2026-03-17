@@ -137,7 +137,16 @@ export function resolveSessionKey(params: {
     return explicit;
   }
 
+  // Allow callers to route to the main session by sending x-openclaw-dm-scope: main
+  // or user: "main". Without this, each unique user field creates a separate session,
+  // splitting context between iMessage, bridge, and other sources.
+  const dmScope = getHeader(params.req, "x-openclaw-dm-scope")?.trim();
   const user = params.user?.trim();
+
+  if (dmScope === "main" || user === "main") {
+    return buildAgentMainSessionKey({ agentId: params.agentId, mainKey: "main" });
+  }
+
   const mainKey = user ? `${params.prefix}-user:${user}` : `${params.prefix}:${randomUUID()}`;
   return buildAgentMainSessionKey({ agentId: params.agentId, mainKey });
 }
