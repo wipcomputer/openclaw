@@ -595,44 +595,60 @@ export async function handleOpenAiHttpRequest(
     senderIsOwner,
   });
 
-  if (!stream) {
-    // Steer-backlog: queue into active run if session is busy.
-    try {
-      const cfgForQueue = loadConfig();
-      const queueMode = cfgForQueue.messages?.queue?.mode;
-      if (queueMode === "steer" || queueMode === "steer-backlog") {
-        const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
-        const sessionIdForQueue = sessionEntryForQueue?.sessionId;
-        if (sessionIdForQueue) {
-          const queued = queueEmbeddedPiMessage(sessionIdForQueue, prompt.message);
-          if (queued) {
-            res.setHeader("x-openclaw-queued", "steer");
-            sendJson(res, 200, {
-              id: runId,
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model,
-              choices: [
-                {
-                  index: 0,
-                  message: {
-                    role: "assistant",
-                    content:
-                      "[queued] Steered into the currently running turn.",
-                  },
-                  finish_reason: "stop",
-                },
-              ],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-            return true;
-          }
-        }
+  // Steer-backlog: queue into active run if session is busy.
+  let queuedAsSteer = false;
+  try {
+    const cfgForQueue = loadConfig();
+    const queueMode = cfgForQueue.messages?.queue?.mode;
+    if (queueMode === "steer" || queueMode === "steer-backlog") {
+      const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
+      const sessionIdForQueue = sessionEntryForQueue?.sessionId;
+      if (sessionIdForQueue) {
+        queuedAsSteer = queueEmbeddedPiMessage(sessionIdForQueue, prompt.message);
       }
-    } catch (err) {
-      logWarn(`openai-compat: steer-backlog pre-check failed: ${String(err)}`);
     }
+  } catch (err) {
+    logWarn(`openai-compat: steer-backlog pre-check failed: ${String(err)}`);
+  }
 
+  const queuedContent =
+    "[queued] Delivered to the agent's next-turn queue.";
+
+  if (queuedAsSteer && !stream) {
+    res.setHeader("x-openclaw-queued", "steer");
+    sendJson(res, 200, {
+      id: runId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: queuedContent },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    return true;
+  }
+
+  if (queuedAsSteer && stream) {
+    res.setHeader("x-openclaw-queued", "steer");
+    setSseHeaders(res);
+    writeAssistantRoleChunk(res, { runId, model });
+    writeAssistantContentChunk(res, {
+      runId,
+      model,
+      content: queuedContent,
+      finishReason: "stop",
+    });
+    writeDone(res);
+    res.end();
+    return true;
+  }
+
+  if (!stream) {
     const stopWatchingDisconnect = watchClientDisconnect(req, res, abortController);
     try {
       const result = await agentCommandFromIngress(commandInput, defaultRuntime, deps);
