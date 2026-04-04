@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ImageContent } from "../agents/command/types.js";
 import { normalizeUsage, toOpenAiChatCompletionsUsage } from "../agents/usage.js";
+import { queueEmbeddedPiMessage } from "../agents/pi-embedded-runner/runs.js";
+import { loadSessionEntryByKey } from "../agents/subagent-announce-delivery.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
+import { loadConfig } from "../config/io.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
@@ -593,6 +596,43 @@ export async function handleOpenAiHttpRequest(
   });
 
   if (!stream) {
+    // Steer-backlog: queue into active run if session is busy.
+    try {
+      const cfgForQueue = loadConfig();
+      const queueMode = cfgForQueue.messages?.queue?.mode;
+      if (queueMode === "steer" || queueMode === "steer-backlog") {
+        const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
+        const sessionIdForQueue = sessionEntryForQueue?.sessionId;
+        if (sessionIdForQueue) {
+          const queued = queueEmbeddedPiMessage(sessionIdForQueue, prompt.message);
+          if (queued) {
+            res.setHeader("x-openclaw-queued", "steer");
+            sendJson(res, 200, {
+              id: runId,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: "assistant",
+                    content:
+                      "[queued] Steered into the currently running turn.",
+                  },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            });
+            return true;
+          }
+        }
+      }
+    } catch (err) {
+      logWarn(`openai-compat: steer-backlog pre-check failed: ${String(err)}`);
+    }
+
     const stopWatchingDisconnect = watchClientDisconnect(req, res, abortController);
     try {
       const result = await agentCommandFromIngress(commandInput, defaultRuntime, deps);
