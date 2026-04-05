@@ -630,7 +630,7 @@ export async function handleOpenAiHttpRequest(
   const queuedContent = "[queued] Delivered to the agent's next-turn queue.";
 
   if (queuedAsSteer && !stream) {
-    res.setHeader("x-openclaw-queued", "steer");
+    res.setHeader("x-openclaw-queued", "next-turn");
     sendJson(res, 200, {
       id: runId,
       object: "chat.completion",
@@ -649,7 +649,7 @@ export async function handleOpenAiHttpRequest(
   }
 
   if (queuedAsSteer && stream) {
-    res.setHeader("x-openclaw-queued", "steer");
+    res.setHeader("x-openclaw-queued", "next-turn");
     setSseHeaders(res);
     writeAssistantRoleChunk(res, { runId, model });
     writeAssistantContentChunk(res, {
