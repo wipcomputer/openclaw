@@ -306,7 +306,7 @@ export abstract class MemoryManagerSyncOps {
         .prepare(
           `SELECT provider, model, provider_key, hash, embedding, dims, updated_at FROM ${EMBEDDING_CACHE_TABLE}`,
         )
-        .all() as Array<{
+        .iterate() as IterableIterator<{
         provider: string;
         model: string;
         provider_key: string;
@@ -315,9 +315,7 @@ export abstract class MemoryManagerSyncOps {
         dims: number | null;
         updated_at: number;
       }>;
-      if (!rows.length) {
-        return;
-      }
+      // Note: no early-return on empty iterator; BEGIN/COMMIT over an empty tx is cheap.
       const insert = this.db.prepare(
         `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, provider_key, hash, embedding, dims, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
