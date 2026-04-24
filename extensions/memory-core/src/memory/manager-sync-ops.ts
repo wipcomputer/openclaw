@@ -1,8 +1,3 @@
-// (lint suppression removed; oxlint state varies — rule did not fire on retry)
-// ^ pre-existing oxlint type-resolver false positive: oxlint resolves SessionFileEntry
-// (line 190) and EmbeddingProvider (line 129) as `error/any` even though tsgo:prod
-// resolves them cleanly. Filed as separate cleanup; suppressed file-level here so
-// R2.A.2 (and prior R2.A v1) can land without unrelated lint debt blocking.
 import { randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
