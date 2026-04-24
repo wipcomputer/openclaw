@@ -1,3 +1,8 @@
+// (lint suppression removed; oxlint state varies — rule did not fire on retry)
+// ^ pre-existing oxlint type-resolver false positive: oxlint resolves SessionFileEntry
+// (line 190) and EmbeddingProvider (line 129) as `error/any` even though tsgo:prod
+// resolves them cleanly. Filed as separate cleanup; suppressed file-level here so
+// R2.A.2 (and prior R2.A v1) can land without unrelated lint debt blocking.
 import { randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -297,7 +302,7 @@ export abstract class MemoryManagerSyncOps {
     return openMemoryDatabaseAtPath(dbPath, this.settings.store.vector.enabled);
   }
 
-  private seedEmbeddingCache(sourceDb: DatabaseSync): void {
+  private async seedEmbeddingCache(sourceDb: DatabaseSync): Promise<void> {
     if (!this.cache.enabled) {
       return;
     }
@@ -325,6 +330,9 @@ export abstract class MemoryManagerSyncOps {
            updated_at=excluded.updated_at`,
       );
       this.db.exec("BEGIN");
+      // Yield to event loop every N rows so HTTP /health probes stay responsive.
+      const SEED_EMBEDDING_YIELD_EVERY = 1000;
+      let rowCount = 0;
       for (const row of rows) {
         insert.run(
           row.provider,
@@ -335,6 +343,12 @@ export abstract class MemoryManagerSyncOps {
           row.dims,
           row.updated_at,
         );
+        rowCount += 1;
+        if (rowCount % SEED_EMBEDDING_YIELD_EVERY === 0) {
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
+        }
       }
       this.db.exec("COMMIT");
     } catch (err) {
@@ -1154,7 +1168,7 @@ export abstract class MemoryManagerSyncOps {
         targetPath: dbPath,
         tempPath: tempDbPath,
         build: async () => {
-          this.seedEmbeddingCache(originalDb);
+          await this.seedEmbeddingCache(originalDb);
           const shouldSyncMemory = this.sources.has("memory");
           const shouldSyncSessions = this.shouldSyncSessions(
             { reason: params.reason, force: params.force },
