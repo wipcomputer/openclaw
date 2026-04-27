@@ -1026,8 +1026,8 @@ function shouldIncludeBundledPluginRuntimeDeps(params: {
   includeConfiguredChannels?: boolean;
   manifestCache?: BundledPluginRuntimeDepsManifestCache;
 }): boolean {
-  if (params.pluginIds && !params.pluginIds.has(params.pluginId)) {
-    return false;
+  if (params.pluginIds) {
+    return params.pluginIds.has(params.pluginId);
   }
   if (!params.config) {
     return true;

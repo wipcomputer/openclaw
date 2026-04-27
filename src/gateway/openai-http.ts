@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ImageContent } from "../agents/command/types.js";
+import { queueEmbeddedPiMessage } from "../agents/pi-embedded-runner/runs.js";
+import { loadSessionEntryByKey } from "../agents/subagent-announce-delivery.js";
 import {
   hasNonzeroUsage,
   normalizeUsage,
@@ -10,6 +12,7 @@ import {
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
 import { estimateBase64DecodedBytes } from "../media/base64.js";
@@ -48,6 +51,7 @@ import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
   config?: GatewayHttpChatCompletionsConfig;
+  runtimeConfig: OpenClawConfig;
   maxBodyBytes?: number;
   trustedProxies?: string[];
   allowRealIpFallback?: boolean;
@@ -607,6 +611,57 @@ export async function handleOpenAiHttpRequest(
     abortSignal: abortController.signal,
     senderIsOwner,
   });
+
+  // Steer-backlog: queue into active run if session is busy.
+  let queuedAsSteer = false;
+  try {
+    const queueMode = opts.runtimeConfig.messages?.queue?.mode;
+    if (queueMode === "steer" || queueMode === "steer-backlog") {
+      const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
+      const sessionIdForQueue = sessionEntryForQueue?.sessionId;
+      if (sessionIdForQueue) {
+        queuedAsSteer = queueEmbeddedPiMessage(sessionIdForQueue, prompt.message);
+      }
+    }
+  } catch (err) {
+    logWarn(`openai-compat: steer-backlog pre-check failed: ${String(err)}`);
+  }
+
+  const queuedContent = "[queued] Delivered to the agent's next-turn queue.";
+
+  if (queuedAsSteer && !stream) {
+    res.setHeader("x-openclaw-queued", "next-turn");
+    sendJson(res, 200, {
+      id: runId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: queuedContent },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    return true;
+  }
+
+  if (queuedAsSteer && stream) {
+    res.setHeader("x-openclaw-queued", "next-turn");
+    setSseHeaders(res);
+    writeAssistantRoleChunk(res, { runId, model });
+    writeAssistantContentChunk(res, {
+      runId,
+      model,
+      content: queuedContent,
+      finishReason: "stop",
+    });
+    writeDone(res);
+    res.end();
+    return true;
+  }
 
   if (!stream) {
     const stopWatchingDisconnect = watchClientDisconnect(req, res, abortController);

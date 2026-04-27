@@ -1044,6 +1044,7 @@ export function createGatewayHttpServer(opts: {
             (await getOpenAiHttpModule()).handleOpenAiHttpRequest(req, res, {
               auth: resolvedAuth,
               config: openAiChatCompletionsConfig,
+              runtimeConfig: configSnapshot,
               trustedProxies,
               allowRealIpFallback,
               rateLimiter,
