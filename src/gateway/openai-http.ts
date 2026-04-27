@@ -11,8 +11,8 @@ import {
 } from "../agents/usage.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
-import { loadConfig } from "../config/io.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
 import { estimateBase64DecodedBytes } from "../media/base64.js";
@@ -51,6 +51,7 @@ import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
   config?: GatewayHttpChatCompletionsConfig;
+  runtimeConfig: OpenClawConfig;
   maxBodyBytes?: number;
   trustedProxies?: string[];
   allowRealIpFallback?: boolean;
@@ -614,8 +615,7 @@ export async function handleOpenAiHttpRequest(
   // Steer-backlog: queue into active run if session is busy.
   let queuedAsSteer = false;
   try {
-    const cfgForQueue = loadConfig();
-    const queueMode = cfgForQueue.messages?.queue?.mode;
+    const queueMode = opts.runtimeConfig.messages?.queue?.mode;
     if (queueMode === "steer" || queueMode === "steer-backlog") {
       const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
       const sessionIdForQueue = sessionEntryForQueue?.sessionId;
