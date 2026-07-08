@@ -1,4 +1,9 @@
-import { confirm, isCancel, select } from "@clack/prompts";
+// Interactive updater entrypoint: resolves current install/channel state, prompts for
+// a target channel, then delegates the actual mutation to the non-interactive updater.
+import { confirm, isCancel } from "@clack/prompts";
+import { selectStyled } from "../../../packages/terminal-core/src/prompt-select-styled.js";
+import { stylePromptMessage } from "../../../packages/terminal-core/src/prompt-style.js";
+import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { readConfigFileSnapshot } from "../../config/config.js";
 import {
   formatUpdateChannelLabel,
@@ -7,27 +12,18 @@ import {
 } from "../../infra/update-channels.js";
 import { checkUpdateStatus } from "../../infra/update-check.js";
 import { defaultRuntime } from "../../runtime.js";
-import { stylePromptHint, stylePromptMessage } from "../../terminal/prompt-style.js";
-import { theme } from "../../terminal/theme.js";
 import { pathExists } from "../../utils.js";
 import {
   isEmptyDir,
   isGitCheckout,
+  parseTimeoutMsOrExit,
   resolveGitInstallDir,
   resolveUpdateRoot,
   type UpdateWizardOptions,
 } from "./shared.js";
 import { updateCommand } from "./update-command.js";
 
-const selectStyled = <T>(params: Parameters<typeof select<T>>[0]) =>
-  select({
-    ...params,
-    message: stylePromptMessage(params.message),
-    options: params.options.map((opt) =>
-      opt.hint === undefined ? opt : { ...opt, hint: stylePromptHint(opt.hint) },
-    ),
-  });
-
+/** Run the TTY-only update wizard and preserve `updateCommand` as the single update executor. */
 export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) {
     defaultRuntime.error(
@@ -37,10 +33,8 @@ export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promi
     return;
   }
 
-  const timeoutMs = opts.timeout ? Number.parseInt(opts.timeout, 10) * 1000 : undefined;
-  if (timeoutMs !== undefined && (Number.isNaN(timeoutMs) || timeoutMs <= 0)) {
-    defaultRuntime.error("--timeout must be a positive integer (seconds)");
-    defaultRuntime.exit(1);
+  const timeoutMs = parseTimeoutMsOrExit(opts.timeout);
+  if (timeoutMs === null) {
     return;
   }
 
@@ -150,7 +144,7 @@ export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promi
   try {
     await updateCommand({
       channel: requestedChannel ?? undefined,
-      restart: Boolean(restart),
+      restart,
       timeout: opts.timeout,
     });
   } catch (err) {

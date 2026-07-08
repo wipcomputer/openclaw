@@ -1,9 +1,9 @@
+// Irc tests cover normalize plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   buildIrcAllowlistCandidates,
   normalizeIrcAllowEntry,
   normalizeIrcMessagingTarget,
-  resolveIrcAllowlistMatch,
 } from "./normalize.js";
 
 describe("irc normalize", () => {
@@ -30,17 +30,7 @@ describe("irc normalize", () => {
     };
 
     expect(buildIrcAllowlistCandidates(message)).toContain("alice!ident@example.org");
-    expect(
-      resolveIrcAllowlistMatch({
-        allowFrom: ["alice!ident@example.org"],
-        message,
-      }).allowed,
-    ).toBe(true);
-    expect(
-      resolveIrcAllowlistMatch({
-        allowFrom: ["bob"],
-        message,
-      }).allowed,
-    ).toBe(false);
+    expect(buildIrcAllowlistCandidates(message)).not.toContain("alice");
+    expect(buildIrcAllowlistCandidates(message, { allowNameMatching: true })).toContain("alice");
   });
 });

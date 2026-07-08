@@ -1,6 +1,8 @@
 // Cloud Code Assist API rejects a subset of JSON Schema keywords.
 // This module scrubs/normalizes tool schemas to keep Gemini happy.
 
+import type { TSchema } from "typebox";
+
 // Keywords that Cloud Code Assist API rejects (not compliant with their JSON Schema subset)
 export const GEMINI_UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
   "patternProperties",
@@ -27,6 +29,11 @@ export const GEMINI_UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
   "uniqueItems",
   "minProperties",
   "maxProperties",
+
+  // JSON Schema composition keywords not supported by OpenAPI 3.0 subset.
+  // `const` is handled separately (converted to enum) in the cleaning loop,
+  // but `not` has no safe equivalent and must be stripped.
+  "not",
 ]);
 
 const SCHEMA_META_KEYS = ["description", "title", "default"] as const;
@@ -207,34 +214,35 @@ function simplifyUnionVariants(params: { obj: Record<string, unknown>; variants:
   return { variants: stripped ? nonNullVariants : variants };
 }
 
-function flattenUnionFallback(
-  obj: Record<string, unknown>,
-  value: unknown,
-): Record<string, unknown> | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
+// Gemini rejects object schemas whose `required` entries do not exist in `properties`.
+function sanitizeRequiredFields(schema: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(schema.required)) {
+    return schema;
   }
-  const variants = (value as Record<string, unknown>[]).filter((v) => v && typeof v === "object");
-  const types = new Set(variants.map((v) => v.type).filter(Boolean));
-  if (variants.length === 1) {
-    const merged: Record<string, unknown> = { ...variants[0] };
-    copySchemaMeta(obj, merged);
-    return merged;
+
+  if (
+    !schema.properties ||
+    typeof schema.properties !== "object" ||
+    Array.isArray(schema.properties)
+  ) {
+    if (schema.type === "object") {
+      delete schema.required;
+    }
+    return schema;
   }
-  if (types.size === 1) {
-    const merged: Record<string, unknown> = { type: Array.from(types)[0] };
-    copySchemaMeta(obj, merged);
-    return merged;
+
+  const properties = schema.properties as Record<string, unknown>;
+  const required = schema.required.filter(
+    (key): key is string => typeof key === "string" && Object.hasOwn(properties, key),
+  );
+
+  if (required.length > 0) {
+    schema.required = required;
+  } else {
+    delete schema.required;
   }
-  const first = variants[0];
-  if (first?.type) {
-    const merged: Record<string, unknown> = { type: first.type };
-    copySchemaMeta(obj, merged);
-    return merged;
-  }
-  const merged: Record<string, unknown> = {};
-  copySchemaMeta(obj, merged);
-  return merged;
+
+  return schema;
 }
 
 function cleanSchemaForGeminiWithDefs(
@@ -321,6 +329,11 @@ function cleanSchemaForGeminiWithDefs(
       continue;
     }
 
+    // Google's schema validator rejects `"required": []` — omit empty arrays.
+    if (key === "required" && Array.isArray(value) && value.length === 0) {
+      continue;
+    }
+
     if (key === "type" && (hasAnyOf || hasOneOf)) {
       continue;
     }
@@ -334,14 +347,20 @@ function cleanSchemaForGeminiWithDefs(
       continue;
     }
 
-    if (key === "properties" && value && typeof value === "object") {
-      const props = value as Record<string, unknown>;
-      cleaned[key] = Object.fromEntries(
-        Object.entries(props).map(([k, v]) => [
-          k,
-          cleanSchemaForGeminiWithDefs(v, nextDefs, refStack),
-        ]),
-      );
+    if (key === "properties") {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const props = value as Record<string, unknown>;
+        cleaned[key] = Object.fromEntries(
+          Object.entries(props).map(([k, v]) => [
+            k,
+            cleanSchemaForGeminiWithDefs(v, nextDefs, refStack),
+          ]),
+        );
+      } else {
+        // Guard malformed schemas (e.g. properties: null) that can trigger
+        // downstream Object.* crashes in strict provider validators.
+        cleaned[key] = {};
+      }
     } else if (key === "items" && value) {
       if (Array.isArray(value)) {
         cleaned[key] = value.map((entry) =>
@@ -369,31 +388,71 @@ function cleanSchemaForGeminiWithDefs(
     }
   }
 
-  // Cloud Code Assist API also rejects anyOf/oneOf in nested schemas.
-  // If simplifyUnionVariants couldn't reduce the union above, flatten it
-  // here as a fallback: pick the first variant's type or use a permissive
-  // schema so the tool declaration is accepted.
-  const flattenedAnyOf = flattenUnionFallback(cleaned, cleaned.anyOf);
-  if (flattenedAnyOf) {
-    return flattenedAnyOf;
+  // Cloud Code Assist API rejects anyOf/oneOf in nested schemas even after
+  // simplifyUnionVariants runs above. Flatten remaining unions as a fallback:
+  // pick the common type or use the first variant's type so the tool
+  // declaration is accepted by Google's validation layer.
+  if (cleaned.anyOf && Array.isArray(cleaned.anyOf)) {
+    const flattened = flattenUnionFallback(cleaned, cleaned.anyOf);
+    if (flattened) {
+      return sanitizeRequiredFields(flattened);
+    }
+  }
+  if (cleaned.oneOf && Array.isArray(cleaned.oneOf)) {
+    const flattened = flattenUnionFallback(cleaned, cleaned.oneOf);
+    if (flattened) {
+      return sanitizeRequiredFields(flattened);
+    }
   }
 
-  const flattenedOneOf = flattenUnionFallback(cleaned, cleaned.oneOf);
-  if (flattenedOneOf) {
-    return flattenedOneOf;
-  }
-
-  return cleaned;
+  return sanitizeRequiredFields(cleaned);
 }
 
-export function cleanSchemaForGemini(schema: unknown): unknown {
+/**
+ * Last-resort flattening for anyOf/oneOf arrays that could not be simplified
+ * by `simplifyUnionVariants`. Picks a representative type so the schema is
+ * accepted by Google's restricted JSON Schema validation.
+ */
+function flattenUnionFallback(
+  obj: Record<string, unknown>,
+  variants: unknown[],
+): Record<string, unknown> | undefined {
+  const objects = variants.filter(
+    (v): v is Record<string, unknown> => Boolean(v) && typeof v === "object",
+  );
+  if (objects.length === 0) {
+    return undefined;
+  }
+  const types = new Set(objects.map((v) => v.type).filter(Boolean));
+  if (objects.length === 1) {
+    const merged: Record<string, unknown> = { ...objects[0] };
+    copySchemaMeta(obj, merged);
+    return merged;
+  }
+  if (types.size === 1) {
+    const merged: Record<string, unknown> = { type: Array.from(types)[0] };
+    copySchemaMeta(obj, merged);
+    return merged;
+  }
+  const first = objects[0];
+  if (first?.type) {
+    const merged: Record<string, unknown> = { type: first.type };
+    copySchemaMeta(obj, merged);
+    return merged;
+  }
+  const merged: Record<string, unknown> = {};
+  copySchemaMeta(obj, merged);
+  return merged;
+}
+
+export function cleanSchemaForGemini(schema: unknown): TSchema {
   if (!schema || typeof schema !== "object") {
-    return schema;
+    return schema as TSchema;
   }
   if (Array.isArray(schema)) {
-    return schema.map(cleanSchemaForGemini);
+    return schema.map(cleanSchemaForGemini) as TSchema;
   }
 
   const defs = extendSchemaDefs(undefined, schema as Record<string, unknown>);
-  return cleanSchemaForGeminiWithDefs(schema, defs, undefined);
+  return cleanSchemaForGeminiWithDefs(schema, defs, undefined) as TSchema;
 }

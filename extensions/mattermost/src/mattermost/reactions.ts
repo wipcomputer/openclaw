@@ -1,8 +1,28 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+// Mattermost plugin module implements reactions behavior.
+import {
+  asDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+} from "openclaw/plugin-sdk/number-runtime";
+import { isPrivateNetworkOptInEnabled } from "openclaw/plugin-sdk/ssrf-runtime";
 import { resolveMattermostAccount } from "./accounts.js";
-import { createMattermostClient, fetchMattermostMe, type MattermostClient } from "./client.js";
+import {
+  createMattermostClient,
+  fetchMattermostMe,
+  type MattermostClient,
+  type MattermostFetch,
+} from "./client.js";
+import type { OpenClawConfig } from "./runtime-api.js";
 
 type Result = { ok: true } | { ok: false; error: string };
+type ReactionParams = {
+  cfg: OpenClawConfig;
+  postId: string;
+  emojiName: string;
+  accountId?: string | null;
+  fetchImpl?: MattermostFetch;
+};
+type ReactionMutation = (client: MattermostClient, params: MutationPayload) => Promise<void>;
+type MutationPayload = { userId: string; postId: string; emojiName: string };
 
 const BOT_USER_CACHE_TTL_MS = 10 * 60_000;
 const botUserIdCache = new Map<string, { userId: string; expiresAt: number }>();
@@ -11,16 +31,24 @@ async function resolveBotUserId(
   client: MattermostClient,
   cacheKey: string,
 ): Promise<string | null> {
+  const rawNow = Date.now();
+  const now = asDateTimestampMs(rawNow);
   const cached = botUserIdCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.userId;
+  if (cached) {
+    if (now !== undefined && cached.expiresAt > now) {
+      return cached.userId;
+    }
+    botUserIdCache.delete(cacheKey);
   }
   const me = await fetchMattermostMe(client);
   const userId = me?.id?.trim();
   if (!userId) {
     return null;
   }
-  botUserIdCache.set(cacheKey, { userId, expiresAt: Date.now() + BOT_USER_CACHE_TTL_MS });
+  const expiresAt = resolveExpiresAtMsFromDurationMs(BOT_USER_CACHE_TTL_MS, { nowMs: rawNow });
+  if (expiresAt !== undefined) {
+    botUserIdCache.set(cacheKey, { userId, expiresAt });
+  }
   return userId;
 }
 
@@ -29,38 +57,12 @@ export async function addMattermostReaction(params: {
   postId: string;
   emojiName: string;
   accountId?: string | null;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: MattermostFetch;
 }): Promise<Result> {
-  const resolved = resolveMattermostAccount({ cfg: params.cfg, accountId: params.accountId });
-  const baseUrl = resolved.baseUrl?.trim();
-  const botToken = resolved.botToken?.trim();
-  if (!baseUrl || !botToken) {
-    return { ok: false, error: "Mattermost botToken/baseUrl missing." };
-  }
-
-  const client = createMattermostClient({
-    baseUrl,
-    botToken,
-    fetchImpl: params.fetchImpl,
+  return runMattermostReaction(params, {
+    action: "add",
+    mutation: createReaction,
   });
-
-  const cacheKey = `${baseUrl}:${botToken}`;
-  const userId = await resolveBotUserId(client, cacheKey);
-  if (!userId) {
-    return { ok: false, error: "Mattermost reactions failed: could not resolve bot user id." };
-  }
-
-  try {
-    await createReaction(client, {
-      userId,
-      postId: params.postId,
-      emojiName: params.emojiName,
-    });
-  } catch (err) {
-    return { ok: false, error: `Mattermost add reaction failed: ${String(err)}` };
-  }
-
-  return { ok: true };
 }
 
 export async function removeMattermostReaction(params: {
@@ -68,8 +70,25 @@ export async function removeMattermostReaction(params: {
   postId: string;
   emojiName: string;
   accountId?: string | null;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: MattermostFetch;
 }): Promise<Result> {
+  return runMattermostReaction(params, {
+    action: "remove",
+    mutation: deleteReaction,
+  });
+}
+
+export function resetMattermostReactionBotUserCacheForTests(): void {
+  botUserIdCache.clear();
+}
+
+async function runMattermostReaction(
+  params: ReactionParams,
+  options: {
+    action: "add" | "remove";
+    mutation: ReactionMutation;
+  },
+): Promise<Result> {
   const resolved = resolveMattermostAccount({ cfg: params.cfg, accountId: params.accountId });
   const baseUrl = resolved.baseUrl?.trim();
   const botToken = resolved.botToken?.trim();
@@ -81,6 +100,7 @@ export async function removeMattermostReaction(params: {
     baseUrl,
     botToken,
     fetchImpl: params.fetchImpl,
+    allowPrivateNetwork: isPrivateNetworkOptInEnabled(resolved.config),
   });
 
   const cacheKey = `${baseUrl}:${botToken}`;
@@ -90,22 +110,19 @@ export async function removeMattermostReaction(params: {
   }
 
   try {
-    await deleteReaction(client, {
+    await options.mutation(client, {
       userId,
       postId: params.postId,
       emojiName: params.emojiName,
     });
   } catch (err) {
-    return { ok: false, error: `Mattermost remove reaction failed: ${String(err)}` };
+    return { ok: false, error: `Mattermost ${options.action} reaction failed: ${String(err)}` };
   }
 
   return { ok: true };
 }
 
-async function createReaction(
-  client: MattermostClient,
-  params: { userId: string; postId: string; emojiName: string },
-): Promise<void> {
+async function createReaction(client: MattermostClient, params: MutationPayload): Promise<void> {
   await client.request<Record<string, unknown>>("/reactions", {
     method: "POST",
     body: JSON.stringify({
@@ -116,10 +133,7 @@ async function createReaction(
   });
 }
 
-async function deleteReaction(
-  client: MattermostClient,
-  params: { userId: string; postId: string; emojiName: string },
-): Promise<void> {
+async function deleteReaction(client: MattermostClient, params: MutationPayload): Promise<void> {
   const emoji = encodeURIComponent(params.emojiName);
   await client.request<unknown>(
     `/users/${params.userId}/posts/${params.postId}/reactions/${emoji}`,

@@ -1,60 +1,42 @@
+// Control UI chat module implements message extract behavior.
+import { stripInternalRuntimeContext } from "../../../../src/agents/internal-runtime-context.js";
+import { stripInboundMetadata } from "../../../../src/auto-reply/reply/strip-inbound-meta.js";
 import { stripEnvelope } from "../../../../src/shared/chat-envelope.js";
-import { stripThinkingTags } from "../format.ts";
-
-/**
- * Strip inline directive tags (`[[reply_to_current]]`, `[[reply_to:<id>]]`,
- * `[[audio_as_voice]]`) that should never be rendered to the user.
- * Matches the same patterns as `src/utils/directive-tags.ts`.
- */
-function stripDirectiveTags(text: string): string {
-  return text
-    .replace(/\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+|audio_as_voice)\s*\]\]/gi, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/[ \t]*\n[ \t]*/g, "\n")
-    .trim();
-}
+import { extractAssistantVisibleText as extractSharedAssistantVisibleText } from "../../../../src/shared/chat-message-content.js";
+import { normalizeLowercaseStringOrEmpty, normalizeStringEntries } from "../string-coerce.ts";
+import { stripThinkingTags } from "../strip-thinking-tags.ts";
 
 const textCache = new WeakMap<object, string | null>();
 const thinkingCache = new WeakMap<object, string | null>();
 
+function isTextContentBlockType(value: unknown, role: string): boolean {
+  return (
+    value === "text" ||
+    (role === "user" && value === "input_text") ||
+    (role === "assistant" && (value === "input_text" || value === "output_text"))
+  );
+}
+
+function processMessageText(text: string, role: string): string {
+  const shouldStripInboundMetadata = normalizeLowercaseStringOrEmpty(role) === "user";
+  const withoutInternalContext = stripInternalRuntimeContext(text);
+  if (role === "assistant") {
+    return stripThinkingTags(withoutInternalContext);
+  }
+  return shouldStripInboundMetadata
+    ? stripInboundMetadata(stripEnvelope(withoutInternalContext))
+    : stripEnvelope(withoutInternalContext);
+}
+
 export function extractText(message: unknown): string | null {
   const m = message as Record<string, unknown>;
   const role = typeof m.role === "string" ? m.role : "";
-  const content = m.content;
-  if (typeof content === "string") {
-    let processed = role === "assistant" ? stripThinkingTags(content) : stripEnvelope(content);
-    if (role === "assistant") {
-      processed = stripDirectiveTags(processed);
-    }
-    return processed;
+  const raw =
+    role === "assistant" ? extractSharedAssistantVisibleText(message) : extractRawText(message);
+  if (!raw) {
+    return null;
   }
-  if (Array.isArray(content)) {
-    const parts = content
-      .map((p) => {
-        const item = p as Record<string, unknown>;
-        if (item.type === "text" && typeof item.text === "string") {
-          return item.text;
-        }
-        return null;
-      })
-      .filter((v): v is string => typeof v === "string");
-    if (parts.length > 0) {
-      const joined = parts.join("\n");
-      let processed = role === "assistant" ? stripThinkingTags(joined) : stripEnvelope(joined);
-      if (role === "assistant") {
-        processed = stripDirectiveTags(processed);
-      }
-      return processed;
-    }
-  }
-  if (typeof m.text === "string") {
-    let processed = role === "assistant" ? stripThinkingTags(m.text) : stripEnvelope(m.text);
-    if (role === "assistant") {
-      processed = stripDirectiveTags(processed);
-    }
-    return processed;
-  }
-  return null;
+  return processMessageText(raw, role);
 }
 
 export function extractTextCached(message: unknown): string | null {
@@ -97,7 +79,7 @@ export function extractThinking(message: unknown): string | null {
   const matches = [
     ...rawText.matchAll(/<\s*think(?:ing)?\s*>([\s\S]*?)<\s*\/\s*think(?:ing)?\s*>/gi),
   ];
-  const extracted = matches.map((m) => (m[1] ?? "").trim()).filter(Boolean);
+  const extracted = normalizeStringEntries(matches.map((mLocal) => mLocal[1] ?? ""));
   return extracted.length > 0 ? extracted.join("\n") : null;
 }
 
@@ -116,6 +98,7 @@ export function extractThinkingCached(message: unknown): string | null {
 
 export function extractRawText(message: unknown): string | null {
   const m = message as Record<string, unknown>;
+  const role = normalizeLowercaseStringOrEmpty(m.role);
   const content = m.content;
   if (typeof content === "string") {
     return content;
@@ -124,7 +107,7 @@ export function extractRawText(message: unknown): string | null {
     const parts = content
       .map((p) => {
         const item = p as Record<string, unknown>;
-        if (item.type === "text" && typeof item.text === "string") {
+        if (isTextContentBlockType(item.type, role) && typeof item.text === "string") {
           return item.text;
         }
         return null;

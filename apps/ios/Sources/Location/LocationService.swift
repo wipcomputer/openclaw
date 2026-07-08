@@ -1,9 +1,9 @@
-import OpenClawKit
 import CoreLocation
 import Foundation
+import OpenClawKit
 
 @MainActor
-final class LocationService: NSObject, CLLocationManagerDelegate {
+final class LocationService: NSObject, CLLocationManagerDelegate, LocationServiceCommon {
     enum Error: Swift.Error {
         case timeout
         case unavailable
@@ -12,26 +12,21 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
     private var authContinuation: CheckedContinuation<CLAuthorizationStatus, Never>?
     private var locationContinuation: CheckedContinuation<CLLocation, Swift.Error>?
-    private var updatesContinuation: AsyncStream<CLLocation>.Continuation?
-    private var isStreaming = false
     private var significantLocationCallback: (@Sendable (CLLocation) -> Void)?
     private var isMonitoringSignificantChanges = false
 
+    var locationManager: CLLocationManager {
+        self.manager
+    }
+
+    var locationRequestContinuation: CheckedContinuation<CLLocation, Swift.Error>? {
+        get { self.locationContinuation }
+        set { self.locationContinuation = newValue }
+    }
+
     override init() {
         super.init()
-        self.manager.delegate = self
-        self.manager.desiredAccuracy = kCLLocationAccuracyBest
-    }
-
-    func authorizationStatus() -> CLAuthorizationStatus {
-        self.manager.authorizationStatus
-    }
-
-    func accuracyAuthorization() -> CLAccuracyAuthorization {
-        if #available(iOS 14.0, *) {
-            return self.manager.accuracyAuthorization
-        }
-        return .fullAccuracy
+        self.configureLocationManager()
     }
 
     func ensureAuthorization(mode: OpenClawLocationMode) async -> CLAuthorizationStatus {
@@ -62,26 +57,16 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
         maxAgeMs: Int?,
         timeoutMs: Int?) async throws -> CLLocation
     {
-        let now = Date()
-        if let maxAgeMs,
-           let cached = self.manager.location,
-           now.timeIntervalSince(cached.timestamp) * 1000 <= Double(maxAgeMs)
-        {
-            return cached
-        }
-
-        self.manager.desiredAccuracy = Self.accuracyValue(desiredAccuracy)
-        let timeout = max(0, timeoutMs ?? 10000)
-        return try await self.withTimeout(timeoutMs: timeout) {
-            try await self.requestLocation()
-        }
-    }
-
-    private func requestLocation() async throws -> CLLocation {
-        try await withCheckedThrowingContinuation { cont in
-            self.locationContinuation = cont
-            self.manager.requestLocation()
-        }
+        _ = params
+        return try await LocationCurrentRequest.resolve(
+            manager: self.manager,
+            desiredAccuracy: desiredAccuracy,
+            maxAgeMs: maxAgeMs,
+            timeoutMs: timeoutMs,
+            request: { try await self.requestLocationOnce() },
+            withTimeout: { timeoutMs, operation in
+                try await self.withTimeout(timeoutMs: timeoutMs, operation: operation)
+            })
     }
 
     private func awaitAuthorizationChange() async -> CLAuthorizationStatus {
@@ -97,65 +82,11 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
         try await AsyncTimeout.withTimeoutMs(timeoutMs: timeoutMs, onTimeout: { Error.timeout }, operation: operation)
     }
 
-    private static func accuracyValue(_ accuracy: OpenClawLocationAccuracy) -> CLLocationAccuracy {
-        switch accuracy {
-        case .coarse:
-            kCLLocationAccuracyKilometer
-        case .balanced:
-            kCLLocationAccuracyHundredMeters
-        case .precise:
-            kCLLocationAccuracyBest
-        }
-    }
-
-    func startLocationUpdates(
-        desiredAccuracy: OpenClawLocationAccuracy,
-        significantChangesOnly: Bool) -> AsyncStream<CLLocation>
-    {
-        self.stopLocationUpdates()
-
-        self.manager.desiredAccuracy = Self.accuracyValue(desiredAccuracy)
-        self.manager.pausesLocationUpdatesAutomatically = true
-        self.manager.allowsBackgroundLocationUpdates = true
-
-        self.isStreaming = true
-        if significantChangesOnly {
-            self.manager.startMonitoringSignificantLocationChanges()
-        } else {
-            self.manager.startUpdatingLocation()
-        }
-
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            self.updatesContinuation = continuation
-            continuation.onTermination = { @Sendable _ in
-                Task { @MainActor in
-                    self.stopLocationUpdates()
-                }
-            }
-        }
-    }
-
-    func stopLocationUpdates() {
-        guard self.isStreaming else { return }
-        self.isStreaming = false
-        self.manager.stopUpdatingLocation()
-        self.manager.stopMonitoringSignificantLocationChanges()
-        self.updatesContinuation?.finish()
-        self.updatesContinuation = nil
-    }
-
     func startMonitoringSignificantLocationChanges(onUpdate: @escaping @Sendable (CLLocation) -> Void) {
         self.significantLocationCallback = onUpdate
         guard !self.isMonitoringSignificantChanges else { return }
         self.isMonitoringSignificantChanges = true
         self.manager.startMonitoringSignificantLocationChanges()
-    }
-
-    func stopMonitoringSignificantLocationChanges() {
-        guard self.isMonitoringSignificantChanges else { return }
-        self.isMonitoringSignificantChanges = false
-        self.significantLocationCallback = nil
-        self.manager.stopMonitoringSignificantLocationChanges()
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -184,9 +115,6 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
             }
             if let callback = self.significantLocationCallback, let latest = locs.last {
                 callback(latest)
-            }
-            if let latest = locs.last, let updates = self.updatesContinuation {
-                updates.yield(latest)
             }
         }
     }

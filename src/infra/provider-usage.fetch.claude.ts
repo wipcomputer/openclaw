@@ -1,4 +1,10 @@
-import { fetchJson } from "./provider-usage.fetch.shared.js";
+// Fetches Claude provider usage windows.
+import {
+  buildUsageHttpErrorSnapshot,
+  discardUsageResponseBody,
+  fetchJson,
+  readUsageJson,
+} from "./provider-usage.fetch.shared.js";
 import { clampPercent, PROVIDER_LABELS } from "./provider-usage.shared.js";
 import type { ProviderUsageSnapshot, UsageWindow } from "./provider-usage.types.js";
 
@@ -57,8 +63,8 @@ function resolveClaudeWebSessionKey(): string | undefined {
   if (!cookieHeader) {
     return undefined;
   }
-  const stripped = cookieHeader.replace(/^cookie:\\s*/i, "");
-  const match = stripped.match(/(?:^|;\\s*)sessionKey=([^;\\s]+)/i);
+  const stripped = cookieHeader.replace(/^cookie:\s*/i, "");
+  const match = stripped.match(/(?:^|;\s*)sessionKey=([^;\s]+)/i);
   const value = match?.[1]?.trim();
   return value?.startsWith("sk-ant-") ? value : undefined;
 }
@@ -80,10 +86,15 @@ async function fetchClaudeWebUsage(
     fetchFn,
   );
   if (!orgRes.ok) {
+    await discardUsageResponseBody(orgRes);
     return null;
   }
 
-  const orgs = (await orgRes.json()) as ClaudeWebOrganizationsResponse;
+  const parsedOrgs = await readUsageJson("anthropic", orgRes);
+  if (!parsedOrgs.ok) {
+    return null;
+  }
+  const orgs = parsedOrgs.data as ClaudeWebOrganizationsResponse;
   const orgId = orgs?.[0]?.uuid?.trim();
   if (!orgId) {
     return null;
@@ -96,10 +107,15 @@ async function fetchClaudeWebUsage(
     fetchFn,
   );
   if (!usageRes.ok) {
+    await discardUsageResponseBody(usageRes);
     return null;
   }
 
-  const data = (await usageRes.json()) as ClaudeWebUsageResponse;
+  const parsedUsage = await readUsageJson("anthropic", usageRes);
+  if (!parsedUsage.ok) {
+    return null;
+  }
+  const data = parsedUsage.data as ClaudeWebUsageResponse;
   const windows = buildClaudeUsageWindows(data);
 
   if (windows.length === 0) {
@@ -159,16 +175,18 @@ export async function fetchClaudeUsage(
       }
     }
 
-    const suffix = message ? `: ${message}` : "";
-    return {
+    return buildUsageHttpErrorSnapshot({
       provider: "anthropic",
-      displayName: PROVIDER_LABELS.anthropic,
-      windows: [],
-      error: `HTTP ${res.status}${suffix}`,
-    };
+      status: res.status,
+      message,
+    });
   }
 
-  const data = (await res.json()) as ClaudeUsageResponse;
+  const parsed = await readUsageJson("anthropic", res);
+  if (!parsed.ok) {
+    return parsed.snapshot;
+  }
+  const data = parsed.data as ClaudeUsageResponse;
   const windows = buildClaudeUsageWindows(data);
 
   return {

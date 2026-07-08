@@ -1,3 +1,4 @@
+// Twitch tests cover probe plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { probeTwitch } from "./probe.js";
 import type { TwitchAccountConfig } from "./types.js";
@@ -26,9 +27,8 @@ const mockOnAuthenticationFailure = vi.fn((_handler: () => void) => {
 
 // Connect mock that triggers the registered handler
 const defaultConnectImpl = async () => {
-  // Simulate successful connection by calling the handler after a delay
+  // Simulate successful connection by calling the handler immediately.
   if (connectHandler) {
-    await new Promise((resolve) => setTimeout(resolve, 1));
     connectHandler();
   }
 };
@@ -48,7 +48,7 @@ vi.mock("@twurple/chat", () => ({
 }));
 
 vi.mock("@twurple/auth", () => ({
-  StaticAuthProvider: class {},
+  StaticAuthProvider: function StaticAuthProvider() {},
 }));
 
 describe("probeTwitch", () => {
@@ -114,15 +114,19 @@ describe("probeTwitch", () => {
   });
 
   it("times out when connection takes too long", async () => {
-    mockConnect.mockImplementationOnce(() => new Promise(() => {})); // Never resolves
+    vi.useFakeTimers();
+    try {
+      mockConnect.mockImplementationOnce(() => new Promise(() => {})); // Never resolves
+      const resultPromise = probeTwitch(mockAccount, 100);
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await resultPromise;
 
-    const result = await probeTwitch(mockAccount, 100);
-
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain("timeout");
-
-    // Reset mock
-    mockConnect.mockImplementation(defaultConnectImpl);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("timeout");
+    } finally {
+      vi.useRealTimers();
+      mockConnect.mockImplementation(defaultConnectImpl);
+    }
   });
 
   it("cleans up client even on failure", async () => {
@@ -130,7 +134,6 @@ describe("probeTwitch", () => {
       // Simulate connection failure by calling disconnect handler
       // onDisconnect signature: (manually: boolean, reason?: Error) => void
       if (disconnectHandler) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
         disconnectHandler(false, new Error("Connection failed"));
       }
     });
@@ -150,7 +153,6 @@ describe("probeTwitch", () => {
       // Simulate connection failure by calling disconnect handler
       // onDisconnect signature: (manually: boolean, reason?: Error) => void
       if (disconnectHandler) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
         disconnectHandler(false, new Error("Network error"));
       }
     });
@@ -180,7 +182,6 @@ describe("probeTwitch", () => {
       // Simulate connection failure by calling disconnect handler
       // onDisconnect signature: (manually: boolean, reason?: Error) => void
       if (disconnectHandler) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
         disconnectHandler(false, "String error" as unknown as Error);
       }
     });
