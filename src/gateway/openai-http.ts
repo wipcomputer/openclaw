@@ -1118,7 +1118,7 @@ export async function handleOpenAiHttpRequest(
       }
     } catch (err) {
       if (err !== undefined) {
-        logWarn(`openai-compat: steer queue pre-check failed: ${String(err)}`);
+        logWarn(`openai-compat: steer queue pre-check failed: ${resolveErrorMessage(err)}`);
       }
     }
   }
