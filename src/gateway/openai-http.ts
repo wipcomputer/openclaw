@@ -11,7 +11,7 @@ import {
 import { isClientToolNameConflictError } from "../agents/agent-tool-definition-adapter.js";
 import type { AgentStreamParams, ClientToolDefinition } from "../agents/command/shared-types.js";
 import type { ImageContent } from "../agents/command/types.js";
-import { queueEmbeddedAgentMessage } from "../agents/embedded-agent-runner/runs.js";
+import { queueEmbeddedAgentMessageWithOutcomeAsync } from "../agents/embedded-agent-runner/runs.js";
 import { STREAM_ERROR_FALLBACK_TEXT } from "../agents/stream-message-shared.js";
 import { loadSessionEntryByKey } from "../agents/subagent-announce-delivery.js";
 import {
@@ -21,6 +21,7 @@ import {
   type NormalizedUsage,
   type OpenAiChatCompletionsUsage,
 } from "../agents/usage.js";
+import { resolveQueueSettings } from "../auto-reply/reply/queue/settings-runtime.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
@@ -1083,19 +1084,43 @@ export async function handleOpenAiHttpRequest(
     streamParams,
   });
 
-  // Steer-backlog: queue into active run if session is busy.
+  // Steer queue: only plain text can be acknowledged as queued because the
+  // embedded active-run queue accepts text, not images/tools/model overrides.
   let queuedAsSteer = false;
-  try {
-    const queueMode = opts.runtimeConfig.messages?.queue?.mode;
-    if (queueMode === "steer" || queueMode === "steer-backlog") {
+  const canQueueAsSteer =
+    prompt.message.trim().length > 0 &&
+    images.length === 0 &&
+    resolvedClientTools.length === 0 &&
+    !mergedExtraSystemPrompt &&
+    modelOverride === undefined &&
+    streamParams === undefined;
+  if (canQueueAsSteer) {
+    try {
       const sessionEntryForQueue = loadSessionEntryByKey(sessionKey);
+      const queueSettings = resolveQueueSettings({
+        cfg: opts.runtimeConfig,
+        channel: messageChannel,
+        sessionEntry: sessionEntryForQueue,
+      });
       const sessionIdForQueue = sessionEntryForQueue?.sessionId;
-      if (sessionIdForQueue) {
-        queuedAsSteer = queueEmbeddedAgentMessage(sessionIdForQueue, prompt.message);
+      if (queueSettings.mode === "steer" && sessionIdForQueue) {
+        const queueOutcome = await queueEmbeddedAgentMessageWithOutcomeAsync(
+          sessionIdForQueue,
+          prompt.message,
+          {
+            steeringMode: "all",
+            ...(queueSettings.debounceMs !== undefined
+              ? { debounceMs: queueSettings.debounceMs }
+              : {}),
+          },
+        );
+        queuedAsSteer = queueOutcome.queued;
+      }
+    } catch (err) {
+      if (err !== undefined) {
+        logWarn(`openai-compat: steer queue pre-check failed: ${String(err)}`);
       }
     }
-  } catch (err) {
-    logWarn(`openai-compat: steer-backlog pre-check failed: ${String(err)}`);
   }
 
   const queuedContent = "[queued] Delivered to the agent's next-turn queue.";
