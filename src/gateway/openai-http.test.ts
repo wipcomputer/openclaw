@@ -6,6 +6,10 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createClientToolNameConflictError } from "../agents/agent-tool-definition-adapter.js";
 import {
+  setActiveEmbeddedRun,
+  testing as embeddedRunTesting,
+} from "../agents/embedded-agent-runner/runs.js";
+import {
   createStubSessionHarness,
   emitAssistantTextDelta,
 } from "../agents/embedded-agent-subscribe.e2e-harness.js";
@@ -23,6 +27,7 @@ import {
   startGatewayServerWithRetries,
   testState,
   withGatewayServer,
+  writeSessionStore,
 } from "./test-helpers.js";
 
 installGatewayTestHooks({ scope: "suite" });
@@ -128,6 +133,46 @@ type FirstAgentCommandOptions = {
 
 function firstAgentCommandOptions() {
   return agentCommand.mock.calls.at(0)?.[0] as FirstAgentCommandOptions | undefined;
+}
+
+type QueueRunHandle = Parameters<typeof setActiveEmbeddedRun>[1];
+
+function createQueueRunHandle(overrides?: {
+  isCompacting?: boolean;
+  isStreaming?: boolean;
+  queueMessage?: QueueRunHandle["queueMessage"];
+}): QueueRunHandle {
+  return {
+    abort: vi.fn(),
+    isCompacting: () => overrides?.isCompacting ?? false,
+    isStreaming: () => overrides?.isStreaming ?? true,
+    queueMessage: overrides?.queueMessage ?? vi.fn(async () => {}),
+  };
+}
+
+async function seedOpenAiQueueSession(params: {
+  queueMode?: "collect" | "followup" | "interrupt" | "steer";
+  sessionId: string;
+  sessionQueueMode?: "collect" | "followup" | "interrupt" | "steer";
+}) {
+  const storePath = path.join(
+    process.env.OPENCLAW_STATE_DIR ?? process.cwd(),
+    `openai-http-queue-${params.sessionId}.json`,
+  );
+  testState.sessionStorePath = storePath;
+  await writeGatewayConfig({
+    messages: { queue: { mode: params.queueMode ?? "steer" } },
+  });
+  await writeSessionStore({
+    entries: {
+      main: {
+        sessionId: params.sessionId,
+        updatedAt: Date.now(),
+        ...(params.sessionQueueMode ? { queueMode: params.sessionQueueMode } : {}),
+      },
+    },
+  });
+  resetConfigRuntimeState();
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
@@ -306,6 +351,35 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(res.status).toBe(200);
 
         expect(firstAgentCommandOptions()?.sessionKey ?? "").toContain("openai-user:alice");
+        await res.text();
+      }
+
+      {
+        mockAgentOnce([{ text: "hello" }]);
+        const res = await postChatCompletions(
+          port,
+          {
+            model: "openclaw",
+            messages: [{ role: "user", content: "hi" }],
+          },
+          { "x-openclaw-dm-scope": "main" },
+        );
+        expect(res.status).toBe(200);
+
+        expect(firstAgentCommandOptions()?.sessionKey).toBe("agent:main:main");
+        await res.text();
+      }
+
+      {
+        mockAgentOnce([{ text: "hello" }]);
+        const res = await postChatCompletions(port, {
+          user: "main",
+          model: "openclaw",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        expect(res.status).toBe(200);
+
+        expect(firstAgentCommandOptions()?.sessionKey).toBe("agent:main:main");
         await res.text();
       }
 
@@ -1468,6 +1542,196 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
     } finally {
       testState.agentsConfig = undefined;
       resetConfigRuntimeState();
+    }
+  });
+
+  it("returns queued success only after a non-streaming active run accepts plain text", async () => {
+    const queueMessage = vi.fn(async () => {});
+    await seedOpenAiQueueSession({ sessionId: "session-openai-queue-json" });
+    setActiveEmbeddedRun(
+      "session-openai-queue-json",
+      createQueueRunHandle({ queueMessage }),
+      "agent:main:main",
+    );
+    try {
+      agentCommand.mockClear();
+      const res = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: false,
+        messages: [{ role: "user", content: "please keep this for next turn" }],
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-openclaw-queued")).toBe("next-turn");
+      const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      expect(json.choices?.[0]?.message?.content).toBe(
+        "[queued] Delivered to the agent's next-turn queue.",
+      );
+      expect(queueMessage).toHaveBeenCalledWith("please keep this for next turn", {
+        steeringMode: "all",
+        debounceMs: 500,
+      });
+      expect(agentCommand).toHaveBeenCalledTimes(0);
+    } finally {
+      embeddedRunTesting.resetActiveEmbeddedRuns();
+    }
+  });
+
+  it("returns queued SSE only after a streaming active run accepts plain text", async () => {
+    const queueMessage = vi.fn(async () => {});
+    await seedOpenAiQueueSession({ sessionId: "session-openai-queue-stream" });
+    setActiveEmbeddedRun(
+      "session-openai-queue-stream",
+      createQueueRunHandle({ queueMessage }),
+      "agent:main:main",
+    );
+    try {
+      agentCommand.mockClear();
+      const res = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: true,
+        messages: [{ role: "user", content: "stream this into next turn" }],
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-openclaw-queued")).toBe("next-turn");
+      expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
+      const chunks = parseSseDataLines(await res.text());
+      expect(chunks.at(-1)).toBe("[DONE]");
+      expect(chunks.some((chunk) => chunk.includes("Delivered to the agent"))).toBe(true);
+      expect(queueMessage).toHaveBeenCalledWith("stream this into next turn", {
+        steeringMode: "all",
+        debounceMs: 500,
+      });
+      expect(agentCommand).toHaveBeenCalledTimes(0);
+    } finally {
+      embeddedRunTesting.resetActiveEmbeddedRuns();
+    }
+  });
+
+  it("falls through to the normal command path when async active-run queueing rejects", async () => {
+    const queueMessage = vi.fn(async () => {
+      throw new Error("active run rejected steering");
+    });
+    await seedOpenAiQueueSession({ sessionId: "session-openai-queue-rejected" });
+    setActiveEmbeddedRun(
+      "session-openai-queue-rejected",
+      createQueueRunHandle({ queueMessage }),
+      "agent:main:main",
+    );
+    try {
+      agentCommand.mockClear();
+      agentCommand.mockResolvedValueOnce({ payloads: [{ text: "normal path" }] } as never);
+      const res = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: false,
+        messages: [{ role: "user", content: "do not false-ack this" }],
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-openclaw-queued")).toBeNull();
+      const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      expect(json.choices?.[0]?.message?.content).toBe("normal path");
+      expect(queueMessage).toHaveBeenCalledTimes(1);
+      expect(agentCommand).toHaveBeenCalledTimes(1);
+    } finally {
+      embeddedRunTesting.resetActiveEmbeddedRuns();
+    }
+  });
+
+  it("does not queue rich OpenAI-compatible requests that need full command semantics", async () => {
+    const queueMessage = vi.fn(async () => {});
+    await seedOpenAiQueueSession({ sessionId: "session-openai-rich-no-queue" });
+    setActiveEmbeddedRun(
+      "session-openai-rich-no-queue",
+      createQueueRunHandle({ queueMessage }),
+      "agent:main:main",
+    );
+    try {
+      agentCommand.mockClear();
+      agentCommand.mockResolvedValue({ payloads: [{ text: "rich path" }] } as never);
+
+      const imageRes = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: false,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "inspect this" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==" } },
+            ],
+          },
+        ],
+      });
+      expect(imageRes.status).toBe(200);
+      await imageRes.text();
+
+      const toolRes = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: false,
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "get_time",
+              description: "Get current time",
+              parameters: { type: "object", properties: {} },
+            },
+          },
+        ],
+        messages: [{ role: "user", content: "use the tool if needed" }],
+      });
+      expect(toolRes.status).toBe(200);
+      await toolRes.text();
+
+      expect(queueMessage).toHaveBeenCalledTimes(0);
+      expect(agentCommand).toHaveBeenCalledTimes(2);
+      expect(
+        (agentCommand.mock.calls[0]?.[0] as FirstAgentCommandOptions | undefined)?.images,
+      ).toEqual([{ type: "image", data: "QUJDRA==", mimeType: "image/png" }]);
+      expect(
+        (agentCommand.mock.calls[1]?.[0] as FirstAgentCommandOptions | undefined)?.clientTools,
+      ).toHaveLength(1);
+    } finally {
+      embeddedRunTesting.resetActiveEmbeddedRuns();
+    }
+  });
+
+  it("honors persisted session queue mode before returning queued HTTP success", async () => {
+    const queueMessage = vi.fn(async () => {});
+    await seedOpenAiQueueSession({
+      queueMode: "steer",
+      sessionId: "session-openai-queue-followup",
+      sessionQueueMode: "followup",
+    });
+    setActiveEmbeddedRun(
+      "session-openai-queue-followup",
+      createQueueRunHandle({ queueMessage }),
+      "agent:main:main",
+    );
+    try {
+      agentCommand.mockClear();
+      agentCommand.mockResolvedValueOnce({ payloads: [{ text: "followup mode path" }] } as never);
+      const res = await postChatCompletions(enabledPort, {
+        model: "openclaw",
+        user: "main",
+        stream: false,
+        messages: [{ role: "user", content: "respect queue override" }],
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-openclaw-queued")).toBeNull();
+      await res.text();
+      expect(queueMessage).toHaveBeenCalledTimes(0);
+      expect(agentCommand).toHaveBeenCalledTimes(1);
+    } finally {
+      embeddedRunTesting.resetActiveEmbeddedRuns();
     }
   });
 
